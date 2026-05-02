@@ -431,7 +431,31 @@ impl MacInterface {
         data: ControlIn,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        self.device.clone().control_in(data, timeout)
+        let timeout = timeout.as_millis().try_into().expect("timeout too long");
+        let mut v = ManuallyDrop::new(vec![0; data.length as usize]);
+        let t =
+            unsafe { TransferData::from_raw(v.as_mut_ptr(), v.len() as u32, v.capacity() as u32) };
+
+        let req = IOUSBDevRequestTO {
+            bmRequestType: data.request_type(),
+            bRequest: data.request,
+            wValue: data.value,
+            wIndex: data.index,
+            wLength: data.length,
+            pData: t.buf as *mut c_void,
+            wLenDone: 0,
+            completionTimeout: timeout,
+            noDataTimeout: timeout,
+        };
+
+        TransferFuture::new(t, |t| self.submit_control(Direction::In, t, req)).map(move |t| {
+            drop(self); // ensure interface stays alive
+            t.status()?;
+            let mut v = unsafe { Vec::from_raw_parts(t.buf, t.actual_len as usize, t.capacity as usize) };
+            let data = v.to_vec();
+            unsafe { v.set_len(0) };
+            Ok(data)
+        })
     }
 
     pub fn control_out(
@@ -439,7 +463,61 @@ impl MacInterface {
         data: ControlOut,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        self.device.clone().control_out(data, timeout)
+        let timeout = timeout.as_millis().try_into().expect("timeout too long");
+        let mut v = ManuallyDrop::new(data.data.to_vec());
+        let t =
+            unsafe { TransferData::from_raw(v.as_mut_ptr(), v.len() as u32, v.capacity() as u32) };
+
+        let req = IOUSBDevRequestTO {
+            bmRequestType: data.request_type(),
+            bRequest: data.request,
+            wValue: data.value,
+            wIndex: data.index,
+            wLength: u16::try_from(data.data.len()).expect("request too long"),
+            pData: t.buf as *mut c_void,
+            wLenDone: 0,
+            completionTimeout: timeout,
+            noDataTimeout: timeout,
+        };
+
+        TransferFuture::new(t, |t| self.submit_control(Direction::Out, t, req)).map(move |t| {
+            drop(self); // ensure interface stays alive
+            t.status()?;
+            Ok(())
+        })
+    }
+
+    fn submit_control(
+        &self,
+        dir: Direction,
+        mut t: Idle<TransferData>,
+        mut req: IOUSBDevRequestTO,
+    ) -> Pending<TransferData> {
+        t.actual_len = 0;
+        assert!(req.pData == t.buf.cast());
+
+        let t = t.pre_submit();
+        let ptr = t.as_ptr();
+
+        let res = unsafe {
+            call_iokit_function!(
+                self.interface.raw,
+                ControlRequestAsyncTO(0, &mut req, Some(transfer_callback), ptr as *mut c_void)
+            )
+        };
+
+        if res == kIOReturnSuccess {
+            debug!("Submitted interface control {dir:?} {ptr:?}");
+        } else {
+            error!("Failed to submit interface control {dir:?} {ptr:?}: {res:x}");
+            unsafe {
+                // Complete the transfer in the place of the callback
+                (*ptr).status = res;
+                notify_completion::<super::TransferData>(ptr);
+            }
+        }
+
+        t
     }
 
     pub fn endpoint(
